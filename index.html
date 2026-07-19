@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="auto">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="© 2024 NINS (by JPGT). Face Mesh Tracking System.">
+    <title>nins/FaceMesh</title>
+    <style>
+        /* 讓 HTML 與 body 佔滿整個瀏覽器視窗 */
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000; /* 未被畫面填滿的區域會顯示黑色 */
+            font-family: "Courier New", Courier, monospace, Arial, sans-serif; /* 復古終端機風格 */
+            color: #00ff66;
+            cursor: pointer; /* 提示使用者整個畫面都可以點擊 */
+        }
+
+        /* 滿版容器 */
+        .container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* 🚀 視訊與畫布等比例縮放，且絕對不裁切 */
+        #webcam, #output_canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain; /* 保證鏡頭畫面 100% 完整呈現，不被切割 */
+        }
+
+        #webcam {
+            transform: scaleX(-1); /* 鏡像翻轉 */
+            transition: opacity 0.3s ease; /* 讓顯示/隱藏時有平滑淡入淡出的效果 */
+            opacity: 0; /* 預設為隱藏狀態（全黑背景） */
+        }
+
+        /* 當含有 .show 類別時才顯示視訊畫面 */
+        #webcam.show {
+            opacity: 1;
+        }
+
+        /* 狀態列：浮動在正上方 */
+        #status-container {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            text-align: center;
+            width: 320px;
+            background: rgba(5, 5, 5, 0.85);
+            padding: 15px;
+            border-radius: 4px;
+            border: 1px solid #00ff66;
+            box-shadow: 0 0 15px rgba(0, 255, 102, 0.3);
+            pointer-events: none; /* 避免擋住點擊 */
+        }
+        #status {
+            color: #ffb74d;
+            font-weight: bold;
+        }
+
+        /* 浮動儀表板：浮動在左下方顯示雙眼中心座標 */
+        #info-panel {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            z-index: 10;
+            background: rgba(5, 5, 5, 0.85);
+            padding: 12px 20px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: bold;
+            border: 1px solid #00ff66;
+            box-shadow: 0 0 10px rgba(0, 255, 102, 0.2);
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="status-container" style="display: none;">
+        <div id="status">正在載入輕量化臉部模型...</div>
+    </div>
+
+    <!-- 浮動顯示雙眼瞳孔座標 -->
+    <div id="info-panel" style="display: none;">
+        EYE_TRACKING_DATA >> <br>
+        <span id="coord-display" style="color: #00ffff;">等待偵測...</span>
+    </div>
+
+    <!-- 滿版容器 -->
+    <div class="container">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="output_canvas"></canvas>
+    </div>
+
+    <script type="module">
+        // 引入 MediaPipe Tasks Vision 庫中的 FaceLandmarker
+        import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+        const video = document.getElementById("webcam");
+        const canvasElement = document.getElementById("output_canvas");
+        const canvasCtx = canvasElement.getContext("2d");
+        
+        const statusContainer = document.getElementById("status-container");
+        const statusDiv = document.getElementById("status");
+        const infoPanel = document.getElementById("info-panel");
+        const coordDisplay = document.getElementById("coord-display");
+
+        let faceLandmarker = undefined;
+        let lastVideoTime = -1;
+
+        // 🎯 點擊整個畫面的任意處，切換 video 的背景鏡頭顯示/隱藏
+        document.addEventListener("click", () => {
+            video.classList.toggle("show");
+        });
+
+        // 1. 初始化臉部網格偵測器[cite: 1]
+        async function initFace() {
+            try {
+                statusDiv.innerText = "正在載入 WebAssembly 核心...";
+                ///statusContainer.style.display = "block";
+                const vision = await FilesetResolver.forVisionTasks(
+                    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+                );
+                
+                statusDiv.innerText = "正在初始化臉部辨識模型...";
+                faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+                    baseOptions: {
+                        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+                        delegate: "GPU"
+                    },
+                    runningMode: "VIDEO",
+                    numFaces: 1 // 鎖定單一人臉
+                });
+
+                statusDiv.innerText = "載入成功！正在啟用攝影機...";
+                statusDiv.style.color = "#00ff66";
+                
+                startCamera();
+            } catch (error) {
+                statusDiv.innerText = "初始化失敗：" + error.message;
+                statusDiv.style.color = "#ef5350";
+            }
+        }
+
+        // 啟動相機[cite: 1]
+        async function startCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { width: { ideal: 1280 }, height: { ideal: 720 } } 
+                });
+                video.srcObject = stream;
+                video.addEventListener("loadeddata", () => {
+                    canvasElement.width = video.videoWidth;
+                    canvasElement.height = video.videoHeight;
+                    
+                    statusContainer.style.display = "none";
+                    ///infoPanel.style.display = "block";
+                    
+                    requestAnimationFrame(predictWebcam);
+                });
+            } catch (err) {
+                statusDiv.innerText = "無法讀取相機：" + err;
+                statusDiv.style.color = "#ef5350";
+            }
+        }
+
+        // 2. 偵測與渲染循環[cite: 1]
+        async function predictWebcam() {
+            if (video.currentTime === lastVideoTime) {
+                requestAnimationFrame(predictWebcam); //  正確，應該回呼 predictWebcam
+                ///requestAnimationFrame(predictVideoTime); // 修正拼字並重新循環
+                return;
+            }
+            lastVideoTime = video.currentTime;
+
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            const startTimeMs = performance.now();
+            const results = faceLandmarker.detectForVideo(video, startTimeMs);
+
+            if (results && results.faceLandmarks && results.faceLandmarks.length > 0) {
+                const landmarks = results.faceLandmarks[0]; // 取得第一張臉
+
+                // MediaPipe 網格定義中，468 與 473 分別通常為左眼與右眼的瞳孔中心點
+                const leftIris = landmarks[468];
+                const rightIris = landmarks[473];
+
+                // 1. 如果抓到瞳孔，繪製高科技亮藍色雷達追蹤十字線
+                if (leftIris && rightIris) {
+                    // 左眼在畫布上的實際像素與渲染位置
+                    const lX = Math.round(leftIris.x * canvasElement.width);
+                    const lY = Math.round(leftIris.y * canvasElement.height);
+                    const renderLX = canvasElement.width - (leftIris.x * canvasElement.width);
+                    const renderLY = leftIris.y * canvasElement.height;
+
+                    // 右眼在畫布上的實際像素與渲染位置
+                    const rX = Math.round(rightIris.x * canvasElement.width);
+                    const rY = Math.round(rightIris.y * canvasElement.height);
+                    const renderRX = canvasElement.width - (rightIris.x * canvasElement.width);
+                    const renderRY = rightIris.y * canvasElement.height;
+
+                    // 更新左下角面板儀表數據
+                    coordDisplay.innerHTML = `L_EYE >> X: ${lX}, Y: ${lY}<br>R_EYE >> X: ${rX}, Y: ${rY}`;
+
+                    // 開始畫雷達線 (亮藍色)
+                    canvasCtx.strokeStyle = "rgba(0, 255, 255, 0.4)";
+                    canvasCtx.lineWidth = 1;
+
+                    // 左眼十字線
+                    canvasCtx.beginPath();
+                    canvasCtx.moveTo(0, renderLY); canvasCtx.lineTo(canvasElement.width, renderLY);
+                    canvasCtx.moveTo(renderLX, 0); canvasCtx.lineTo(renderLX, canvasElement.height);
+                    canvasCtx.stroke();
+
+                    // 右眼十字線
+                    canvasCtx.beginPath();
+                    canvasCtx.moveTo(0, renderRY); canvasCtx.lineTo(canvasElement.width, renderRY);
+                    canvasCtx.moveTo(renderRX, 0); canvasCtx.lineTo(renderRX, canvasElement.height);
+                    canvasCtx.stroke();
+
+                    // 單獨將瞳孔圓點放大並著上亮藍色
+                    canvasCtx.fillStyle = "#00ffff";
+                    canvasCtx.beginPath(); canvasCtx.arc(renderLX, renderLY, 5, 0, 2 * Math.PI); canvasCtx.fill();
+                    canvasCtx.beginPath(); canvasCtx.arc(renderRX, renderRY, 5, 0, 2 * Math.PI); canvasCtx.fill();
+                }
+
+                // 2. 遍歷臉部其餘所有的 478 個網格點（調為極簡復古綠點）
+                canvasCtx.fillStyle = "rgba(0, 255, 102, 0.6)";
+                landmarks.forEach((point, index) => {
+                    // 跳過剛剛已經畫過的兩顆特殊瞳孔中心點 (468, 473)
+                    if (index !== 468 && index !== 473) {
+                        const renderX = canvasElement.width - (point.x * canvasElement.width);
+                        const renderY = point.y * canvasElement.height;
+                        
+                        canvasCtx.beginPath();
+                        // 臉部點位極多，用半徑 1.5px 的微型點效果最好、最像精密的 3D 掃描
+                        canvasCtx.arc(renderX, renderY, 1.5, 0, 2 * Math.PI);
+                        canvasCtx.fill();
+                    }
+                });
+            } else {
+                coordDisplay.innerText = "STANDBY (未偵測到人臉)";
+            }
+
+            requestAnimationFrame(predictWebcam);
+        }
+
+        initFace();
+    </script>
+</body>
+</html>
